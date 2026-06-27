@@ -1,5 +1,9 @@
+import time
+
 import torch
 import torch.distributions as dist
+
+from arviz import from_dict, ess, rhat
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -13,8 +17,19 @@ class SamplerState:
     log_prob: torch.Tensor        # (num_chains,) cached log prob
     extras: dict = field(default_factory=dict)  # momentum, step_size, etc.
 
-## create base class that defines run and other logging
-## sub classes inherit and define step, called in run
+@dataclass
+class SamplerResults:
+    """Structured output to return results from MCMCSampler runs"""
+    params: torch.Tensor            # (num_chains, num_iters -(burnin + 1), dim) -- parameter values per iteration 
+    acceptance_rate: torch.Tensor   # (num_chains, dim) -- acceptance rate per chain
+    final_ess: torch.Tensor         # effective sample size for each parameter
+    final_ess_per_second: torch.Tensor  # effective sample size per second for each parameter
+    final_rhat: torch.Tensor        # rhat or gelman_rubin statistic per parameter
+    wall_time: float                # wall time in seconds for time to run sampling algorithm
+    burnin: int                     # number of burnin iters to help plotting
+    diagnostics: dict[torch.Tensor] # additional algorithm specific metrics
+
+
 class MCMCSampler(ABC):
 
     def __init__(
@@ -28,6 +43,8 @@ class MCMCSampler(ABC):
         self.dim = dim
         self.init_dist = init_dist
         torch.manual_seed(seed)
+        # results filled in when sampler's run method is called
+        self.results = None
 
     @abstractmethod
     def step(self, state: SamplerState) -> tuple[SamplerState, dict]:
@@ -38,38 +55,47 @@ class MCMCSampler(ABC):
         params = self.init_dist.sample((num_chains,)).reshape(num_chains, self.dim)
         return SamplerState(params=params, log_prob=self.log_prob_fn(params))
 
-    def run(self, num_iters: int, num_chains: int, burnin: int = 0):
+    def run(self, num_iters: int, num_chains: int, burnin: int = 0) -> None:
         assert burnin < num_iters, f"burnin (got {burnin}) must be less than num_iters (got {num_iters})"
+
+        start_time = time.perf_counter()
         state = self.init_state(num_chains)
-        history = torch.empty((num_chains, num_iters + 1, self.dim))
-        history[:, 0, :] = state.params
-        gelman_rubin = torch.empty((num_iters - (burnin + 2), self.dim))
+        history = torch.empty((num_chains, num_iters, self.dim))
         diagnostics = defaultdict(list)
 
         for t in range(num_iters):
             state, info = self.step(state)
-            history[:, t + 1, :] = state.params
-            if t > burnin + 1:
-                gelman_rubin[t - (burnin + 2), :] = self.calc_gelman_rubin(
-                    results = history[:, burnin + 1:, :], 
-                    num_chains = num_chains
-                )
+            history[:, t, :] = state.params
+            
+            ## variant specific results
             for k, v in info.items():
                 diagnostics[k].append(v)
-        
-        self.history = history
-        self.results = history[:, burnin + 1:, :]
-        self.diagnostics = {k: torch.stack(v) for k, v in diagnostics.items()}
-        self.gelman_rubin = gelman_rubin
-        if "accept" in self.diagnostics:
-              self.acceptance_rate = self.diagnostics["accept"].float().mean(dim=0)
-        return history
+
+        end_time = time.perf_counter()
+        wall_time = end_time - start_time
+
+        ## create run summary
+        self.results = self.calculate_summary_statistics(
+            history = history,
+            burnin=burnin,
+            diagnostics=diagnostics,
+            wall_time=wall_time
+        )
     
-    def calc_gelman_rubin(self, results: torch.Tensor, num_chains: int) -> torch.Tensor:
-          L = results.shape[1]
-          chain_means = results.mean(dim=1)
-          grand_mean = chain_means.mean(dim=0)
-          B = (L / (num_chains - 1)) * (chain_means - grand_mean).pow(2).sum(dim=0)
-          W = ((1 / (L - 1)) * (results - chain_means.unsqueeze(1)).pow(2).sum(dim=1)).mean(dim=0)
-          var_hat = ((L - 1) / L) * W + (1 / L) * B
-          return torch.sqrt(var_hat / W)
+    def calculate_summary_statistics(self, history: torch.Tensor, burnin: int, diagnostics: dict, wall_time: float):
+        inference_data = from_dict(posterior={"theta": history[:, burnin:, :].numpy()})
+        final_ess = ess(inference_data, var_names = ["theta"])['theta'].values
+        final_ess_per_second = final_ess / wall_time
+        final_rhat = rhat(inference_data, var_names = ["theta"])['theta'].values
+        if "accept" in diagnostics.keys():
+            acceptance_rate = torch.stack(diagnostics['accept']).T[:, burnin:].to(torch.float).mean(dim = 0)
+        return SamplerResults(
+            params = inference_data,
+            acceptance_rate = acceptance_rate,
+            final_ess = final_ess,
+            final_ess_per_second = final_ess_per_second,
+            final_rhat = final_rhat,
+            wall_time = wall_time,
+            burnin = burnin,
+            diagnostics = diagnostics,
+        )
