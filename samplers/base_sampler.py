@@ -22,9 +22,9 @@ class SamplerResults:
     """Structured output to return results from MCMCSampler runs"""
     params: torch.Tensor            # (num_chains, num_iters -(burnin + 1), dim) -- parameter values per iteration 
     acceptance_rate: torch.Tensor   # (num_chains, dim) -- acceptance rate per chain
-    final_ess: torch.Tensor         # effective sample size for each parameter
-    final_ess_per_second: torch.Tensor  # effective sample size per second for each parameter
-    final_rhat: torch.Tensor        # rhat or gelman_rubin statistic per parameter
+    bulk_ess_per_second: torch.Tensor  # bulk effective sample size per second for each parameter
+    tail_ess_per_second: torch.Tensor  # tail effective sample size per second for each parameter
+    rhat: torch.Tensor        # rhat or gelman_rubin statistic per parameter
     wall_time: float                # wall time in seconds for time to run sampling algorithm
     burnin: int                     # number of burnin iters to help plotting
     diagnostics: dict[torch.Tensor] # additional algorithm specific metrics
@@ -83,18 +83,33 @@ class MCMCSampler(ABC):
         )
     
     def calculate_summary_statistics(self, history: torch.Tensor, burnin: int, diagnostics: dict, wall_time: float):
+        params = history[:, burnin:, :]
         inference_data = from_dict(posterior={"theta": history[:, burnin:, :].numpy()})
-        final_ess = ess(inference_data, var_names = ["theta"])['theta'].values
-        final_ess_per_second = final_ess / wall_time
-        final_rhat = rhat(inference_data, var_names = ["theta"])['theta'].values
+        final_bulk_ess = torch.Tensor(
+            ess(inference_data, var_names = ["theta"], method = "bulk")["theta"].values
+        )
+
+        final_bulk_ess_per_second = final_bulk_ess / wall_time
+
+        final_tail_ess = torch.Tensor(
+            ess(inference_data, var_names = ["theta"], method = "tail")["theta"].values
+        )
+
+        final_tail_ess_per_second = final_tail_ess / wall_time
+
+        final_rhat = torch.Tensor(
+            rhat(inference_data, var_names = ["theta"])['theta'].values
+        )
+
         if "accept" in diagnostics.keys():
-            acceptance_rate = torch.stack(diagnostics['accept']).T[:, burnin:].to(torch.float).mean(dim = 0)
+            acceptance_rate = torch.stack(diagnostics['accept']).T[:, burnin:].to(torch.float).mean(dim = 1)
+
         return SamplerResults(
-            params = inference_data,
+            params = params,
             acceptance_rate = acceptance_rate,
-            final_ess = final_ess,
-            final_ess_per_second = final_ess_per_second,
-            final_rhat = final_rhat,
+            bulk_ess_per_second = final_bulk_ess_per_second,
+            tail_ess_per_second = final_tail_ess_per_second,
+            rhat = final_rhat,
             wall_time = wall_time,
             burnin = burnin,
             diagnostics = diagnostics,
